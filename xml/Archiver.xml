@@ -1,11 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <pipeline
-    xmlns="http://glast-ground.slac.stanford.edu/pipeline"
-    xmlns:xs="http://www.w3.org/2001/XMLSchema-instance"
-    xs:schemaLocation="
-        http://glast-ground.slac.stanford.edu/pipeline
-        https://glast-ground.slac.stanford.edu/Pipeline-II/schemas/2.1/pipeline.xsd"
->
+  xmlns="http://glast-ground.slac.stanford.edu/pipeline"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://glast-ground.slac.stanford.edu/pipeline https://glast-ground.slac.stanford.edu/Pipeline-II/schemas/2.3/pipeline.xsd">
 
   <!-- Change log.
        v1.3 2020-03-10 tether First production version.
@@ -16,12 +13,13 @@
            or else the script will get errors due to command "11"
            not being found.
        v1.8 2020-04-15 Make sure that all dates and times are UTC.
+       v2.0 2026-02-05 omodei first version to be used on S3DF
   -->
 
   <!-- The type of "Archiver" ensures that the processes run as
        user glast (pipeline site daemon SLAC).
   -->
-  <task name="Archiver" type="Archiver" version="1.8">
+  <task name="Archiver" type="Archiver" version="2.0">
     <notation>
       Replacement for the old Disk Archiver workflow service. Backs up Level 0 data for the day
       7 days before a given base date and fcopy data for the day before the base date.
@@ -74,10 +72,21 @@
    -->
 
     <variables>
-      <var name="archiveRoot">/nfs/farm/g/glast/u23/ISOC-flight/Archive</var>
-      <var name="astoreRoot">/nfs/astore-new/g/glstore</var>
+      <var name="taskBase">/sdf/group/fermi/ground/PipelineConfig/Archiver</var>
+      <var name="archiveRoot">/sdf/data/fermi/ground/ISOC/flight/Archive</var>
+      <var name="astoreRoot">/local-astore/g/glstores</var>
       <var name="isocPlatform">rhel6_gcc44</var>
       <var name="isocFlavor">PROD</var>
+      <!-- We are on slurm on S3DF -->
+      <var name="jobsite">S3DFDATA</var>
+      <var name="extra">--partition=fermi-transfer --account=fermi:other-pipelines --qos=normal --nodes=1 -n1 --cpus-per-task=1 --mem=1G --pty</var>
+
+      <!-- container and wrapper -->
+      <var name="container_image">/sdf/group/fermi/sw/containers/fermi-rhel6.sif</var>
+      <var name="container_env"></var>
+      <var name="container_volumes">--bind /sdf/group/fermi/n:/nfs/farm/g/glast --bind /sdf/group/fermi/a:/afs/slac.stanford.edu/g/glast --bind /sdf/group/fermi/a:/afs/slac/g/glast --bind /sdf:/sdf --bind /lscratch:/lscratch --bind /sdf/group/fermi/sw/package:/afs/slac/package --bind /sdf/group/fermi/sw/package:/afs/slac.stanford.edu/package --bind /sdf/group/fermi/sw/containers/rhel6/opt/TWWfsw:/opt/TWWfsw --bind /sdf/group/fermi/sw/containers/rhel6/usr/local:/usr/local --bind /sdf/group/fermi/sw/java/jdk/jdk8:/usr/lib/jvm/jre-1.8.0-openjdk</var>
+      <var name="container_wrap">singularity exec ${container_env} ${container_volumes} ${container_image}</var>
+      <var name="isocenv_wrap">sh ${taskBase}/scripts/isocenv_wrapper.sh</var>
     </variables>
 
     <prerequisites>
@@ -88,70 +97,35 @@
       <prerequisite name="baseDate" type="string"/>
     </prerequisites>
 
-
-
-    <process name="fcopy">
-
+    <process name="fcopy" site="${jobsite}">
       <notation>Archive one day's fcopy archive.</notation>
-
-      <job batchOptions="-We 10">
-        #!/bin/bash -vxeu
-        targetDate=$(date -u -d "${baseDate} 1 day ago" -I)
-        # Date-related part of the path in the fcopy archive.
-        datePath=$(date -u -d "${targetDate}" +"%Y/%m/%j.%m.%d.%a")
-        # Date-related part of the tar file name.
-        dateName=$(echo ${datePath} | sed -e "s+/+-+g")
-        cd "${archiveRoot}"
-        tar cf "${astoreRoot}/FOS-fcopy-${dateName}-0.tar" "fcopy/${datePath}"
-        touch "fcopy/${datePath}/archive_done"
-      </job>
-
+      <job 
+        batchOptions=" --time 00:01:00 ${extra} "
+        executable="${taskBase}/scripts/archive_fcopy.sh ${baseDate}"/>
     </process>
 
 
 
-    <process name="fcopyCleaner">
+    <process name="fcopyCleaner" site="${jobsite}">
 
       <notation>Run FcopyCleaner.py for the fcopy day that was just backed up,
            but ONLY if the "fcopy" process was successful.
       </notation>
 
-      <job batchOptions="-We 10">
-        #!/bin/bash -vxe
-        # For the ISOC environment setup to work
-        # properly the "error on undefined variable" flag must
-        # not be set.
-        eval $(/afs/slac/g/glast/isoc/flightOps/${isocPlatform}/ISOC_${isocFlavor}/bin/isoc isoc_env --add-env=flightops)
-        # Now we can set up full error checking.
-        set -vxeu
-        targetDate=$(date -u -d "${baseDate} 1 day ago" -I)
-        FcopyCleaner.py --beg "${targetDate} 00:00:00" --end "+24 hours" --unlink --outgoing
-      </job>
+      <job 
+        batchOptions=" --time 00:01:00 ${extra} "
+        executable="${container_wrap} ${isocenv_wrap} ${taskBase}/scripts/fcopy_cleaner_wrapper.sh ${baseDate}"/>
 
       <depends>
-	<after process="fcopy" status="SUCCESS" />
+      	<after process="fcopy" status="SUCCESS" />
       </depends>
-
     </process>
 
-
-
-    <process name="level0">
-
+    <process name="level0" site="${jobsite}">
       <notation>Archive one day of level0 raw data.</notation>
-
-      <job batchOptions="-We 10">
-        #!/bin/bash -vxeu
-        targetDate=$(date -u -d "${baseDate} 7 days ago" -I)
-        # Date-related part of the path in the fcopy archive.
-        datePath=$(date -u -d "${targetDate}" +"%Y/%m/%j.%m.%d.%a")
-        # Date-related part of the tar file name.
-        dateName=$(echo ${datePath} | sed -e "s+/+-+g")
-        cd "${archiveRoot}"
-        tar cf "${astoreRoot}/FOS-level0-src0077-${dateName}-0.tar" "level0/src0077/${datePath}"
-        touch "level0/src0077/${datePath}/archive_done"
-      </job>
-
+      <job 
+        batchOptions=" --time 00:01:00 ${extra} "
+        executable="${container_wrap} ${isocenv_wrap} ${taskBase}/scripts/archive_level0.sh ${baseDate}"/>
     </process>
 
 
