@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pipeline
+    xmlns="http://glast-ground.slac.stanford.edu/pipeline"
+    xmlns:xs="http://www.w3.org/2001/XMLSchema-instance"
+    xs:schemaLocation="
+        http://glast-ground.slac.stanford.edu/pipeline
+        https://glast-ground.slac.stanford.edu/Pipeline-II/schemas/2.1/pipeline.xsd"
+>
+
+  <!-- Change log.
+       v1.3 2020-03-10 tether First production version.
+       v1.4 2020-04-07 tether Use the RHEL6 ISOC build in order
+           to avoid a problem with missing OpenSSL 0.98 libs
+           in the RHEL 5 build.
+       v1.7 2020-04-08 Ensure that no bash script line begins with a tab
+           or else the script will get errors due to command "11"
+           not being found.
+       v1.8 2020-04-15 Make sure that all dates and times are UTC.
+  -->
+
+  <!-- The type of "Archiver" ensures that the processes run as
+       user glast (pipeline site daemon SLAC).
+  -->
+  <task name="Archiver" type="Archiver" version="1.8">
+    <notation>
+      Replacement for the old Disk Archiver workflow service. Backs up Level 0 data for the day
+      7 days before a given base date and fcopy data for the day before the base date.
+      </notation>
+
+      <!--
+      Dates and times are always UTC since that's what's used for the
+      directory hierarchies in the ISOC data archives.      
+
+      Given a base date, usually the date on which the stream was
+      created, archive the raw level0 data for the day seven days
+      before the base date and archive the fcopy archive for the day
+      before the base date. The base date must be supplied in the
+      variable "baseDate" defined in the createStream command.
+
+      The archives created are tar files on /nfs/astore-new/g/glstore
+      which is a POSIX filesystem interface to HPSS. For compatibility
+      with the old Disk Archiver the names of the tar files will have
+      the same format, for example:
+
+      FOS-fcopy-2008-11-335.11.30.Sun-0.tar
+      FOS-level0-src0077-2008-10-280.10.06.Mon-0.tar
+
+      "FOS" is the "module", used to designate flight-operations data
+      as opposed to, say, scientific analysis data or software. The
+      old Disk Archiver was a Fermi-wide facility. "src0077" means
+      that the source ID, or spacecraft ID, is 77 which is the ID of
+      the actual LAT in orbit. The date components are year, month,
+      day of year, month again, day of month, and day of week,
+      obtained using the "date" command with formats %Y, %m, %j, %m,
+      %d and %a respectively. The final number is a tar file sequence
+      number. The original astore service had a 10 GB limit on the
+      size of data files so the Disk Archiver used the "multi-tape"
+      feature of the "tar" command together with an Expect script to
+      change the tar file name when the tar command asked for a new
+      "tape". This pipeline task always creates a single tar file for
+      each archive it makes, so the sequence number will always be
+      zero.
+
+      The tar files created by the old Disk Archiver had all file
+      paths relative to the ISOC archive root, so this task will do
+      the same.
+
+      When it finished a backup the Disk Archiver created a file named
+      "archive_done" in the directory that was backed up. This task
+      does the same but it doesn't put anything in the file.  This
+      marker file must be present along with the file xrootd_done in
+      order for a level0 directory to be removed from disk when it's
+      more than 60 days old.
+   -->
+
+    <variables>
+      <var name="archiveRoot">/nfs/farm/g/glast/u23/ISOC-flight/Archive</var>
+      <var name="astoreRoot">/nfs/astore-new/g/glstore</var>
+      <var name="isocPlatform">rhel6_gcc44</var>
+      <var name="isocFlavor">PROD</var>
+    </variables>
+
+    <prerequisites>
+      <!-- A UTC date D in ISO format YYYY-MM-DD. Each stream for this
+           task will archive the fcopy archive for "D 1 day ago" and
+           the level0 date for "D 7 days ago".
+      -->
+      <prerequisite name="baseDate" type="string"/>
+    </prerequisites>
+
+
+
+    <process name="fcopy">
+
+      <notation>Archive one day's fcopy archive.</notation>
+
+      <job batchOptions="-We 10">
+        #!/bin/bash -vxeu
+        targetDate=$(date -u -d "${baseDate} 1 day ago" -I)
+        # Date-related part of the path in the fcopy archive.
+        datePath=$(date -u -d "${targetDate}" +"%Y/%m/%j.%m.%d.%a")
+        # Date-related part of the tar file name.
+        dateName=$(echo ${datePath} | sed -e "s+/+-+g")
+        cd "${archiveRoot}"
+        tar cf "${astoreRoot}/FOS-fcopy-${dateName}-0.tar" "fcopy/${datePath}"
+        touch "fcopy/${datePath}/archive_done"
+      </job>
+
+    </process>
+
+
+
+    <process name="fcopyCleaner">
+
+      <notation>Run FcopyCleaner.py for the fcopy day that was just backed up,
+           but ONLY if the "fcopy" process was successful.
+      </notation>
+
+      <job batchOptions="-We 10">
+        #!/bin/bash -vxe
+        # For the ISOC environment setup to work
+        # properly the "error on undefined variable" flag must
+        # not be set.
+        eval $(/afs/slac/g/glast/isoc/flightOps/${isocPlatform}/ISOC_${isocFlavor}/bin/isoc isoc_env --add-env=flightops)
+        # Now we can set up full error checking.
+        set -vxeu
+        targetDate=$(date -u -d "${baseDate} 1 day ago" -I)
+        FcopyCleaner.py --beg "${targetDate} 00:00:00" --end "+24 hours" --unlink --outgoing
+      </job>
+
+      <depends>
+	<after process="fcopy" status="SUCCESS" />
+      </depends>
+
+    </process>
+
+
+
+    <process name="level0">
+
+      <notation>Archive one day of level0 raw data.</notation>
+
+      <job batchOptions="-We 10">
+        #!/bin/bash -vxeu
+        targetDate=$(date -u -d "${baseDate} 7 days ago" -I)
+        # Date-related part of the path in the fcopy archive.
+        datePath=$(date -u -d "${targetDate}" +"%Y/%m/%j.%m.%d.%a")
+        # Date-related part of the tar file name.
+        dateName=$(echo ${datePath} | sed -e "s+/+-+g")
+        cd "${archiveRoot}"
+        tar cf "${astoreRoot}/FOS-level0-src0077-${dateName}-0.tar" "level0/src0077/${datePath}"
+        touch "level0/src0077/${datePath}/archive_done"
+      </job>
+
+    </process>
+
+
+
+  </task>
+
+</pipeline>
